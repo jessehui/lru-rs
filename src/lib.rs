@@ -76,8 +76,15 @@ use core::num::NonZeroUsize;
 use core::ptr::{self, NonNull};
 use core::usize;
 
-#[cfg(any(test, not(feature = "hashbrown")))]
+#[cfg(test)]
+#[cfg(not(feature = "hashbrown"))]
+#[cfg(not(feature = "sgx"))]
 extern crate std;
+
+#[cfg(feature = "sgx")]
+#[cfg(not(feature = "hashbrown"))]
+#[cfg(not(test))]
+extern crate sgx_tstd as std;
 
 #[cfg(feature = "hashbrown")]
 use hashbrown::HashMap;
