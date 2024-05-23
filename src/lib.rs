@@ -189,6 +189,10 @@ pub struct LruCache<K, V, S = DefaultHasher> {
     map: HashMap<KeyRef<K>, NonNull<LruEntry<K, V>>, S>,
     cap: NonZeroUsize,
 
+    // Only valid for unbounded LruCache
+    // When the cache size reaches the high watermark, it will try to evict when the condition is met
+    high_watermark: NonZeroUsize,
+
     // head and tail are sigil nodes to facilitate inserting entries
     head: *mut LruEntry<K, V>,
     tail: *mut LruEntry<K, V>,
@@ -221,7 +225,7 @@ impl<K: Hash + Eq, V> LruCache<K, V> {
     /// let mut cache: LruCache<isize, &str> = LruCache::new(NonZeroUsize::new(10).unwrap());
     /// ```
     pub fn new(cap: NonZeroUsize) -> LruCache<K, V> {
-        LruCache::construct(cap, HashMap::with_capacity(cap.get()))
+        LruCache::construct(cap, None, HashMap::with_capacity(cap.get()))
     }
 
     /// Creates a new LRU Cache that never automatically evicts items.
@@ -231,10 +235,14 @@ impl<K: Hash + Eq, V> LruCache<K, V> {
     /// ```
     /// use lru::LruCache;
     /// use std::num::NonZeroUsize;
-    /// let mut cache: LruCache<isize, &str> = LruCache::unbounded();
+    /// let mut cache: LruCache<isize, &str> = LruCache::unbounded(None);
     /// ```
-    pub fn unbounded() -> LruCache<K, V> {
-        LruCache::construct(NonZeroUsize::new(usize::MAX).unwrap(), HashMap::default())
+    pub fn unbounded(high_watermark: Option<NonZeroUsize>) -> LruCache<K, V> {
+        LruCache::construct(
+            NonZeroUsize::new(usize::MAX).unwrap(),
+            high_watermark,
+            HashMap::default(),
+        )
     }
 }
 
@@ -254,6 +262,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
     pub fn with_hasher(cap: NonZeroUsize, hash_builder: S) -> LruCache<K, V, S> {
         LruCache::construct(
             cap,
+            None,
             HashMap::with_capacity_and_hasher(cap.into(), hash_builder),
         )
     }
@@ -272,6 +281,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
     pub fn unbounded_with_hasher(hash_builder: S) -> LruCache<K, V, S> {
         LruCache::construct(
             NonZeroUsize::new(usize::MAX).unwrap(),
+            None,
             HashMap::with_hasher(hash_builder),
         )
     }
@@ -279,13 +289,21 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
     /// Creates a new LRU Cache with the given capacity.
     fn construct(
         cap: NonZeroUsize,
+        high_watermark: Option<NonZeroUsize>,
         map: HashMap<KeyRef<K>, NonNull<LruEntry<K, V>>, S>,
     ) -> LruCache<K, V, S> {
+        let high_watermark = if let Some(watermark) = high_watermark {
+            assert!(watermark <= cap);
+            watermark
+        } else {
+            cap
+        };
         // NB: The compiler warns that cache does not need to be marked as mutable if we
         // declare it as such since we only mutate it inside the unsafe block.
         let cache = LruCache {
             map,
             cap,
+            high_watermark,
             head: Box::into_raw(Box::new(LruEntry::new_sigil())),
             tail: Box::into_raw(Box::new(LruEntry::new_sigil())),
         };
@@ -316,7 +334,8 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
     /// assert_eq!(cache.get(&2), Some(&"beta"));
     /// ```
     pub fn put(&mut self, k: K, v: V) -> Option<V> {
-        self.capturing_put(k, v, false).map(|(_, v)| v)
+        self.capturing_put_with_cond(k, v, false, Self::dummy_cond)
+            .map(|(_, v)| v)
     }
 
     /// Pushes a key-value pair into the cache. If an entry with key `k` already exists in
@@ -344,14 +363,36 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
     /// assert_eq!(cache.get(&3), Some(&"alpha"));
     /// ```
     pub fn push(&mut self, k: K, v: V) -> Option<(K, V)> {
-        self.capturing_put(k, v, true)
+        self.capturing_put_with_cond(k, v, true, Self::dummy_cond)
+    }
+
+    /// Pushes a key-value pair into the cache. If an entry with key `k` already exists in
+    /// the cache, it will update and return the old entry's key-value pair.
+    /// For a new entry, if the cache length reaches the high watermark, it will try to push
+    /// the new entry and evict the least recently used cache entry. If the condition is met,
+    /// the evict will be done. If the condition is not met, the evict will not be done and the
+    /// LRU entry will be updated.
+    pub fn push_and_evict_with_cond<F>(&mut self, k: K, v: V, cond: F) -> Option<(K, V)>
+    where
+        F: Fn(&V) -> bool,
+    {
+        self.capturing_put_with_cond(k, v, true, cond)
     }
 
     // Used internally by `put` and `push` to add a new entry to the lru.
     // Takes ownership of and returns entries replaced due to the cache's capacity
     // when `capture` is true.
-    fn capturing_put(&mut self, k: K, mut v: V, capture: bool) -> Option<(K, V)> {
-        let node_ref = self.map.get_mut(&KeyRef { k: &k });
+    fn capturing_put_with_cond<F>(
+        &mut self,
+        k: K,
+        mut v: V,
+        capture: bool,
+        cond: F,
+    ) -> Option<(K, V)>
+    where
+        F: Fn(&V) -> bool,
+    {
+        let node_ref: Option<&mut NonNull<LruEntry<K, V>>> = self.map.get_mut(&KeyRef { k: &k });
 
         match node_ref {
             Some(node_ref) => {
@@ -369,7 +410,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
                 Some((k, v))
             }
             None => {
-                let (replaced, node) = self.replace_or_create_node(k, v);
+                let (replaced, node) = self.replace_or_create_node(k, v, cond);
                 let node_ptr: *mut LruEntry<K, V> = node.as_ptr();
 
                 self.attach(node_ptr);
@@ -382,10 +423,23 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
         }
     }
 
+    // A dummy condition to always returns true
+    fn dummy_cond(_v: &V) -> bool {
+        true
+    }
+
     // Used internally to swap out a node if the cache is full or to create a new node if space
     // is available. Shared between `put`, `push`, `get_or_insert`, and `get_or_insert_mut`.
     #[allow(clippy::type_complexity)]
-    fn replace_or_create_node(&mut self, k: K, v: V) -> (Option<(K, V)>, NonNull<LruEntry<K, V>>) {
+    fn replace_or_create_node<F>(
+        &mut self,
+        k: K,
+        v: V,
+        cond: F,
+    ) -> (Option<(K, V)>, NonNull<LruEntry<K, V>>)
+    where
+        F: Fn(&V) -> bool,
+    {
         if self.len() == self.cap().get() {
             // if the cache is full, remove the last entry so we can use it for the new key
             let old_key = KeyRef {
@@ -404,14 +458,47 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
 
             self.detach(node_ptr);
 
-            (Some(replaced), old_node)
-        } else {
-            // if the cache is not full allocate a new LruEntry
-            // Safety: We allocate, turn into raw, and get NonNull all in one step.
-            (None, unsafe {
-                NonNull::new_unchecked(Box::into_raw(Box::new(LruEntry::new(k, v))))
-            })
+            return (Some(replaced), old_node);
+        } else if self.len() >= self.high_watermark.get() {
+            // unbounded cache len exceeds the high watermark, try to evict
+
+            // get the LRU entry
+            // if the condition is true, it will be evicted.
+            // if the condition is false, the LRU entry will be moved to the front
+            let old_key = KeyRef {
+                k: unsafe { &(*(*(*self.tail).prev).key.as_ptr()) },
+            };
+            let old_key_raw = unsafe { &*old_key.k } as &K;
+            let old_node = self.get(old_key_raw).unwrap();
+
+            // evict if the cond is true
+            if cond(old_node) == true {
+                log::debug!("evict old node");
+                let old_node = self.map.remove(&old_key).unwrap();
+                let node_ptr: *mut LruEntry<K, V> = old_node.as_ptr();
+                // read out the node's old key and value and then replace it
+                let replaced = unsafe {
+                    (
+                        mem::replace(&mut (*node_ptr).key, mem::MaybeUninit::new(k)).assume_init(),
+                        mem::replace(&mut (*node_ptr).val, mem::MaybeUninit::new(v)).assume_init(),
+                    )
+                };
+
+                self.detach(node_ptr);
+                return (Some(replaced), old_node);
+            }
         }
+
+        // if the cache is not full, or the evict condition is not met, allocate a new LruEntry
+        log::debug!(
+            "replace or create one. allocate new entry, cache len = {:?}",
+            self.len() + 1
+        );
+
+        // Safety: We allocate, turn into raw, and get NonNull all in one step.
+        (None, unsafe {
+            NonNull::new_unchecked(Box::into_raw(Box::new(LruEntry::new(k, v))))
+        })
     }
 
     /// Returns a reference to the value of the key in the cache or `None` if it is not
@@ -601,7 +688,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
             unsafe { &*(*node_ptr).val.as_ptr() }
         } else {
             let v = f();
-            let (_, node) = self.replace_or_create_node(k, v);
+            let (_, node) = self.replace_or_create_node(k, v, Self::dummy_cond);
             let node_ptr: *mut LruEntry<K, V> = node.as_ptr();
 
             self.attach(node_ptr);
@@ -652,7 +739,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
             unsafe { Ok(&*(*node_ptr).val.as_ptr()) }
         } else {
             let v = f()?;
-            let (_, node) = self.replace_or_create_node(k, v);
+            let (_, node) = self.replace_or_create_node(k, v, Self::dummy_cond);
             let node_ptr: *mut LruEntry<K, V> = node.as_ptr();
 
             self.attach(node_ptr);
@@ -698,7 +785,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
             unsafe { &mut *(*node_ptr).val.as_mut_ptr() }
         } else {
             let v = f();
-            let (_, node) = self.replace_or_create_node(k, v);
+            let (_, node) = self.replace_or_create_node(k, v, Self::dummy_cond);
             let node_ptr: *mut LruEntry<K, V> = node.as_ptr();
 
             self.attach(node_ptr);
@@ -750,7 +837,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
             unsafe { Ok(&mut *(*node_ptr).val.as_mut_ptr()) }
         } else {
             let v = f()?;
-            let (_, node) = self.replace_or_create_node(k, v);
+            let (_, node) = self.replace_or_create_node(k, v, Self::dummy_cond);
             let node_ptr: *mut LruEntry<K, V> = node.as_ptr();
 
             self.attach(node_ptr);
@@ -1136,6 +1223,9 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
         self.map.shrink_to_fit();
 
         self.cap = cap;
+
+        // for bounded cache, the high watermakr keeps the same as the cap.
+        self.high_watermark = cap;
     }
 
     /// Clears the contents of the cache.
@@ -1544,7 +1634,7 @@ mod tests {
 
     #[test]
     fn test_unbounded() {
-        let mut cache = LruCache::unbounded();
+        let mut cache = LruCache::unbounded(None);
         for i in 0..13370 {
             cache.put(i, ());
         }
